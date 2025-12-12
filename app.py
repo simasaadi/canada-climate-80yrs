@@ -674,8 +674,8 @@ elif page == "Extremes":
 elif page == "Maps":
     st.subheader("Spatial patterns")
     st.markdown(
-        "<div class='muted'>These are true maps (georeferenced points) rendered with pydeck. "
-        "Use the layer selector to switch between trend and extremes surfaces.</div>",
+        "<div class='muted'>True maps (georeferenced points) rendered with pydeck. "
+        "Layer options include extruded columns, scaled points, and heat surfaces.</div>",
         unsafe_allow_html=True
     )
 
@@ -686,17 +686,18 @@ elif page == "Maps":
     t = temp_trends.copy()
     p = precip_trends.copy()
 
-    # Compute extremes shift (recent-baseline)
+    # Compute extremes shift (recent - baseline)
     ex = extremes.copy()
     ex["period"] = np.where(ex["year"].between(1961, 1990), "1961–1990",
                     np.where(ex["year"].between(1991, 2020), "1991–2020", None))
     ex = ex.dropna(subset=["period"])
+
     exm = (
         ex.groupby(["city", "period"], as_index=False)
         .agg(hot=("hot_days", "mean"), cold=("cold_days", "mean"))
     )
     exw = exm.pivot(index="city", columns="period", values=["hot", "cold"])
-    # Safe access
+
     def _get(w, metric, period):
         try:
             return w[(metric, period)]
@@ -732,15 +733,14 @@ elif page == "Maps":
 
     view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom, pitch=35)
 
-    # Visual scaling helpers
-    def _finite(series):
-        s = pd.to_numeric(series, errors="coerce")
-        return s[np.isfinite(s)]
+    # Helper for safe numeric columns
+    def _num(s):
+        return pd.to_numeric(s, errors="coerce")
 
-    # Build layers
+    # Base layers list
     layers = []
 
-    # Labels
+    # City labels
     layers.append(
         pdk.Layer(
             "TextLayer",
@@ -749,31 +749,32 @@ elif page == "Maps":
             get_text="city",
             get_size=13,
             get_color=[30, 30, 30],
-            get_angle=0,
             get_alignment_baseline="'bottom'",
         )
     )
 
     if "Warming trend" in layer:
-        v = m["slope_c_per_decade"]
-        s = _finite(v)
-        vmax = float(np.nanpercentile(np.abs(s), 95)) if len(s) else 1.0
-
         m2 = m.copy()
-        m2["val"] = pd.to_numeric(m2["slope_c_per_decade"], errors="coerce").fillna(0.0)
+        m2["val"] = _num(m2["slope_c_per_decade"]).fillna(0.0)
 
-        # ColumnLayer: elevation carries magnitude; color by sign
+        # PRECOMPUTE elevation (no abs() in JSON)
+        m2["elevation"] = (m2["val"].abs() * 120000).astype(float)
+
+        # PRECOMPUTE color channels (no conditional expressions in JSON)
+        m2["r"] = np.where(m2["val"] >= 0, 30, 25)
+        m2["g"] = np.where(m2["val"] >= 0, 144, 25)
+        m2["b"] = np.where(m2["val"] >= 0, 255, 112)
+        m2["a"] = 180
+
         layers.append(
             pdk.Layer(
                 "ColumnLayer",
                 data=m2,
                 get_position="[lon, lat]",
-                get_elevation="abs(val) * 120000",   # tuned for Canada zoom
+                get_elevation="elevation",
                 elevation_scale=1,
                 radius=22000,
-                get_fill_color="""
-                    [ 30, 144, 255, 180 ] if val >= 0 else [ 25, 25, 112, 180 ]
-                """,
+                get_fill_color="[r, g, b, a]",
                 pickable=True,
                 auto_highlight=True,
             )
@@ -782,24 +783,24 @@ elif page == "Maps":
         title = "Warming trend (°C/decade) — extruded columns"
 
     elif "Precip trend" in layer:
-        v = m["slope_mm_per_decade"]
-        s = _finite(v)
-        vmax = float(np.nanpercentile(np.abs(s), 95)) if len(s) else 1.0
-
         m2 = m.copy()
-        m2["val"] = pd.to_numeric(m2["slope_mm_per_decade"], errors="coerce").fillna(0.0)
+        m2["val"] = _num(m2["slope_mm_per_decade"]).fillna(0.0)
+        m2["elevation"] = (m2["val"].abs() * 2000).astype(float)
+
+        m2["r"] = np.where(m2["val"] >= 0, 60, 178)
+        m2["g"] = np.where(m2["val"] >= 0, 179, 34)
+        m2["b"] = np.where(m2["val"] >= 0, 113, 34)
+        m2["a"] = 180
 
         layers.append(
             pdk.Layer(
                 "ColumnLayer",
                 data=m2,
                 get_position="[lon, lat]",
-                get_elevation="abs(val) * 2000",
+                get_elevation="elevation",
                 elevation_scale=1,
                 radius=22000,
-                get_fill_color="""
-                    [ 60, 179, 113, 180 ] if val >= 0 else [ 178, 34, 34, 180 ]
-                """,
+                get_fill_color="[r, g, b, a]",
                 pickable=True,
                 auto_highlight=True,
             )
@@ -809,19 +810,25 @@ elif page == "Maps":
 
     elif "Hot extremes shift" in layer:
         m2 = m.copy()
-        m2["val"] = pd.to_numeric(m2["d_hot"], errors="coerce").fillna(0.0)
+        m2["val"] = _num(m2["d_hot"]).fillna(0.0)
+
+        # PRECOMPUTE radius (no abs() in JSON)
+        m2["radius"] = (8000 + m2["val"].abs() * 2500).astype(float)
+
+        m2["r"] = np.where(m2["val"] >= 0, 255, 65)
+        m2["g"] = np.where(m2["val"] >= 0, 69, 105)
+        m2["b"] = np.where(m2["val"] >= 0, 0, 225)
+        m2["a"] = 170
 
         layers.append(
             pdk.Layer(
                 "ScatterplotLayer",
                 data=m2,
                 get_position="[lon, lat]",
-                get_radius="8000 + abs(val) * 2500",
+                get_radius="radius",
                 radius_min_pixels=6,
                 radius_max_pixels=60,
-                get_fill_color="""
-                    [ 255, 69, 0, 170 ] if val >= 0 else [ 65, 105, 225, 170 ]
-                """,
+                get_fill_color="[r, g, b, a]",
                 pickable=True,
                 auto_highlight=True,
             )
@@ -831,28 +838,38 @@ elif page == "Maps":
                 "HeatmapLayer",
                 data=m2,
                 get_position="[lon, lat]",
-                get_weight="abs(val)",
+                get_weight="weight",
                 radiusPixels=90,
             )
         )
+        # Heatmap needs a numeric weight column
+        m2["weight"] = m2["val"].abs().astype(float)
+
         tooltip = {"html": "<b>{city}</b><br/>Δ hot extremes: {val} days/yr", "style": {"backgroundColor": "white"}}
         title = "Change in hot-extreme frequency (1991–2020 vs 1961–1990)"
 
-    else:  # Cold extremes shift
+    else:
         m2 = m.copy()
-        m2["val"] = pd.to_numeric(m2["d_cold"], errors="coerce").fillna(0.0)
+        m2["val"] = _num(m2["d_cold"]).fillna(0.0)
+        m2["radius"] = (8000 + m2["val"].abs() * 2500).astype(float)
+
+        # Here: negative means fewer cold extremes (often expected), but keep sign coloring
+        m2["r"] = np.where(m2["val"] <= 0, 30, 255)
+        m2["g"] = np.where(m2["val"] <= 0, 144, 165)
+        m2["b"] = np.where(m2["val"] <= 0, 255, 0)
+        m2["a"] = 170
+
+        m2["weight"] = m2["val"].abs().astype(float)
 
         layers.append(
             pdk.Layer(
                 "ScatterplotLayer",
                 data=m2,
                 get_position="[lon, lat]",
-                get_radius="8000 + abs(val) * 2500",
+                get_radius="radius",
                 radius_min_pixels=6,
                 radius_max_pixels=60,
-                get_fill_color="""
-                    [ 30, 144, 255, 170 ] if val <= 0 else [ 255, 165, 0, 170 ]
-                """,
+                get_fill_color="[r, g, b, a]",
                 pickable=True,
                 auto_highlight=True,
             )
@@ -862,7 +879,7 @@ elif page == "Maps":
                 "HeatmapLayer",
                 data=m2,
                 get_position="[lon, lat]",
-                get_weight="abs(val)",
+                get_weight="weight",
                 radiusPixels=90,
             )
         )
@@ -877,11 +894,6 @@ elif page == "Maps":
         tooltip=tooltip,
     )
     st.pydeck_chart(deck, use_container_width=True)
-
-    st.markdown(
-        "<div class='small muted'>Tip: If you select just one city, the map will zoom in automatically; for many cities, columns and point radii scale by magnitude.</div>",
-        unsafe_allow_html=True
-    )
 
 
 elif page == "Download":
