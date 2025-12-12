@@ -673,28 +673,35 @@ elif page == "Extremes":
 
 elif page == "Maps":
     st.subheader("Spatial patterns")
-    st.markdown(
-        "<div class='muted'>True maps (georeferenced points) rendered with pydeck. "
-        "Layer options include extruded columns, scaled points, and heat surfaces.</div>",
-        unsafe_allow_html=True
+    st.caption(
+        "These are true maps (georeferenced city points). Because this dataset is city-level (not gridded), "
+        "the map will always show a limited number of locations — the value is in the styling, tooltips, and layers."
     )
+
+    # --- Base map styles that DO NOT require a Mapbox token ---
+    # (These are public styles; they work on Streamlit Cloud without secrets.)
+    BASEMAPS = {
+        "Light (CARTO Positron)": "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        "Dark (CARTO Dark Matter)": "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+    }
+    basemap_choice = st.selectbox("Basemap", list(BASEMAPS.keys()), index=0)
+    map_style = BASEMAPS[basemap_choice]
 
     coords = _get_city_latlon(df_daily)
     coords = coords[coords["city"].isin(cities_sel)].copy()
 
-    # Attach trend + regime shift metrics
-    t = temp_trends.copy()
-    p = precip_trends.copy()
+    # Attach metrics already computed in the app
+    m = coords.merge(temp_trends[["city", "slope_c_per_decade"]], on="city", how="left")
+    m = m.merge(precip_trends[["city", "slope_mm_per_decade"]], on="city", how="left")
 
-    # Compute extremes shift (recent - baseline)
+    # Extremes shift (recent - baseline)
     ex = extremes.copy()
     ex["period"] = np.where(ex["year"].between(1961, 1990), "1961–1990",
                     np.where(ex["year"].between(1991, 2020), "1991–2020", None))
     ex = ex.dropna(subset=["period"])
-
     exm = (
         ex.groupby(["city", "period"], as_index=False)
-        .agg(hot=("hot_days", "mean"), cold=("cold_days", "mean"))
+          .agg(hot=("hot_days", "mean"), cold=("cold_days", "mean"))
     )
     exw = exm.pivot(index="city", columns="period", values=["hot", "cold"])
 
@@ -705,66 +712,96 @@ elif page == "Maps":
             return pd.Series(index=w.index, dtype=float)
 
     ex_shift = pd.DataFrame({"city": exw.index})
-    ex_shift["d_hot"] = (_get(exw, "hot", "1991–2020") - _get(exw, "hot", "1961–1990")).values
+    ex_shift["d_hot"]  = (_get(exw, "hot",  "1991–2020") - _get(exw, "hot",  "1961–1990")).values
     ex_shift["d_cold"] = (_get(exw, "cold", "1991–2020") - _get(exw, "cold", "1961–1990")).values
 
-    m = coords.merge(t[["city", "slope_c_per_decade"]], on="city", how="left")
-    m = m.merge(p[["city", "slope_mm_per_decade"]], on="city", how="left")
     m = m.merge(ex_shift, on="city", how="left")
 
+    # ---------- Better auto-zoom ----------
+    # Compute bounds and choose a zoom that actually frames the selected cities.
+    def _auto_view(df):
+        if len(df) == 0:
+            return pdk.ViewState(latitude=56.1304, longitude=-106.3468, zoom=2.6, pitch=35)
+
+        lat_min, lat_max = float(df["lat"].min()), float(df["lat"].max())
+        lon_min, lon_max = float(df["lon"].min()), float(df["lon"].max())
+        lat_c = (lat_min + lat_max) / 2
+        lon_c = (lon_min + lon_max) / 2
+
+        span = max(abs(lat_max - lat_min), abs(lon_max - lon_min))
+        # Heuristic zoom: smaller span -> higher zoom
+        if span < 2:   zoom = 6.0
+        elif span < 5: zoom = 4.6
+        elif span < 10: zoom = 3.8
+        else:          zoom = 3.0
+
+        return pdk.ViewState(latitude=lat_c, longitude=lon_c, zoom=zoom, pitch=40)
+
+    view_state = _auto_view(m)
+
+    # ---------- Layer selector ----------
     layer = st.selectbox(
         "Map layer",
         [
-            "Warming trend (°C/decade) — extruded columns",
-            "Precip trend (mm/decade) — extruded columns",
-            "Hot extremes shift (days/year) — scatter + heat",
-            "Cold extremes shift (days/year) — scatter + heat",
+            "Warming trend (°C/decade) — 3D columns + points",
+            "Precip trend (mm/decade) — 3D columns + points",
+            "Hot extremes shift (days/year) — sized points + heat",
+            "Cold extremes shift (days/year) — sized points + heat",
         ],
         index=0,
     )
 
-    # Auto-zoom to selection
-    if len(m) == 1:
-        center_lat, center_lon = float(m.iloc[0]["lat"]), float(m.iloc[0]["lon"])
-        zoom = 4.2
-    else:
-        center_lat, center_lon = float(m["lat"].mean()), float(m["lon"].mean())
-        zoom = 3.1
+    # Make sure numeric
+    for col in ["slope_c_per_decade", "slope_mm_per_decade", "d_hot", "d_cold"]:
+        if col in m.columns:
+            m[col] = pd.to_numeric(m[col], errors="coerce")
 
-    view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom, pitch=35)
+    # Helper for color bins (keeps pydeck JSON simple and reliable)
+    def _color_bin(v, neg_rgb, pos_rgb):
+        if pd.isna(v): return [160, 160, 160, 120]
+        return (pos_rgb if v >= 0 else neg_rgb) + [190]
 
-    # Helper for safe numeric columns
-    def _num(s):
-        return pd.to_numeric(s, errors="coerce")
-
-    # Base layers list
     layers = []
 
-    # City labels
+    # City label layer (always on)
     layers.append(
         pdk.Layer(
             "TextLayer",
             data=m,
             get_position="[lon, lat]",
             get_text="city",
-            get_size=13,
-            get_color=[30, 30, 30],
+            get_size=14,
+            get_color=[20, 20, 20],
             get_alignment_baseline="'bottom'",
         )
     )
 
+    # A “base” point layer so the map never looks empty
+    m["_base_r"] = 14000  # meters
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=m,
+            get_position="[lon, lat]",
+            get_radius="_base_r",
+            radius_min_pixels=5,
+            radius_max_pixels=40,
+            get_fill_color=[80, 80, 80, 80],
+            pickable=False,
+        )
+    )
+
+    tooltip = {"html": "<b>{city}</b>", "style": {"backgroundColor": "white"}}
+    title = ""
+
     if "Warming trend" in layer:
+        title = "Warming trend (°C/decade)"
         m2 = m.copy()
-        m2["val"] = _num(m2["slope_c_per_decade"]).fillna(0.0)
+        m2["val"] = m2["slope_c_per_decade"].fillna(0.0)
 
-        # PRECOMPUTE elevation (no abs() in JSON)
+        # Precompute elevation + colors (no functions in JSON)
         m2["elevation"] = (m2["val"].abs() * 120000).astype(float)
-
-        # PRECOMPUTE color channels (no conditional expressions in JSON)
-        m2["r"] = np.where(m2["val"] >= 0, 30, 25)
-        m2["g"] = np.where(m2["val"] >= 0, 144, 25)
-        m2["b"] = np.where(m2["val"] >= 0, 255, 112)
-        m2["a"] = 180
+        m2["fill"] = m2["val"].apply(lambda x: _color_bin(x, [25, 120, 255], [255, 80, 30]))
 
         layers.append(
             pdk.Layer(
@@ -773,24 +810,23 @@ elif page == "Maps":
                 get_position="[lon, lat]",
                 get_elevation="elevation",
                 elevation_scale=1,
-                radius=22000,
-                get_fill_color="[r, g, b, a]",
+                radius=26000,              # bigger so it reads as “map”
+                get_fill_color="fill",
                 pickable=True,
                 auto_highlight=True,
             )
         )
-        tooltip = {"html": "<b>{city}</b><br/>Warming: {val} °C/decade", "style": {"backgroundColor": "white"}}
-        title = "Warming trend (°C/decade) — extruded columns"
+        tooltip = {
+            "html": "<b>{city}</b><br/>Warming: {slope_c_per_decade} °C/decade",
+            "style": {"backgroundColor": "white"},
+        }
 
     elif "Precip trend" in layer:
+        title = "Precipitation trend (mm/decade)"
         m2 = m.copy()
-        m2["val"] = _num(m2["slope_mm_per_decade"]).fillna(0.0)
-        m2["elevation"] = (m2["val"].abs() * 2000).astype(float)
-
-        m2["r"] = np.where(m2["val"] >= 0, 60, 178)
-        m2["g"] = np.where(m2["val"] >= 0, 179, 34)
-        m2["b"] = np.where(m2["val"] >= 0, 113, 34)
-        m2["a"] = 180
+        m2["val"] = m2["slope_mm_per_decade"].fillna(0.0)
+        m2["elevation"] = (m2["val"].abs() * 2500).astype(float)
+        m2["fill"] = m2["val"].apply(lambda x: _color_bin(x, [30, 144, 255], [46, 184, 92]))
 
         layers.append(
             pdk.Layer(
@@ -799,26 +835,24 @@ elif page == "Maps":
                 get_position="[lon, lat]",
                 get_elevation="elevation",
                 elevation_scale=1,
-                radius=22000,
-                get_fill_color="[r, g, b, a]",
+                radius=26000,
+                get_fill_color="fill",
                 pickable=True,
                 auto_highlight=True,
             )
         )
-        tooltip = {"html": "<b>{city}</b><br/>Precip trend: {val} mm/decade", "style": {"backgroundColor": "white"}}
-        title = "Precipitation trend (mm/decade) — extruded columns"
+        tooltip = {
+            "html": "<b>{city}</b><br/>Precip trend: {slope_mm_per_decade} mm/decade",
+            "style": {"backgroundColor": "white"},
+        }
 
     elif "Hot extremes shift" in layer:
+        title = "Change in hot extremes (1991–2020 vs 1961–1990)"
         m2 = m.copy()
-        m2["val"] = _num(m2["d_hot"]).fillna(0.0)
-
-        # PRECOMPUTE radius (no abs() in JSON)
-        m2["radius"] = (8000 + m2["val"].abs() * 2500).astype(float)
-
-        m2["r"] = np.where(m2["val"] >= 0, 255, 65)
-        m2["g"] = np.where(m2["val"] >= 0, 69, 105)
-        m2["b"] = np.where(m2["val"] >= 0, 0, 225)
-        m2["a"] = 170
+        m2["val"] = m2["d_hot"].fillna(0.0)
+        m2["radius"] = (12000 + m2["val"].abs() * 3500).astype(float)
+        m2["fill"] = m2["val"].apply(lambda x: _color_bin(x, [30, 144, 255], [255, 60, 0]))
+        m2["weight"] = m2["val"].abs().astype(float)
 
         layers.append(
             pdk.Layer(
@@ -827,8 +861,8 @@ elif page == "Maps":
                 get_position="[lon, lat]",
                 get_radius="radius",
                 radius_min_pixels=6,
-                radius_max_pixels=60,
-                get_fill_color="[r, g, b, a]",
+                radius_max_pixels=70,
+                get_fill_color="fill",
                 pickable=True,
                 auto_highlight=True,
             )
@@ -839,26 +873,21 @@ elif page == "Maps":
                 data=m2,
                 get_position="[lon, lat]",
                 get_weight="weight",
-                radiusPixels=90,
+                radiusPixels=110,
             )
         )
-        # Heatmap needs a numeric weight column
-        m2["weight"] = m2["val"].abs().astype(float)
-
-        tooltip = {"html": "<b>{city}</b><br/>Δ hot extremes: {val} days/yr", "style": {"backgroundColor": "white"}}
-        title = "Change in hot-extreme frequency (1991–2020 vs 1961–1990)"
+        tooltip = {
+            "html": "<b>{city}</b><br/>Δ hot extremes: {d_hot} days/year",
+            "style": {"backgroundColor": "white"},
+        }
 
     else:
+        title = "Change in cold extremes (1991–2020 vs 1961–1990)"
         m2 = m.copy()
-        m2["val"] = _num(m2["d_cold"]).fillna(0.0)
-        m2["radius"] = (8000 + m2["val"].abs() * 2500).astype(float)
-
-        # Here: negative means fewer cold extremes (often expected), but keep sign coloring
-        m2["r"] = np.where(m2["val"] <= 0, 30, 255)
-        m2["g"] = np.where(m2["val"] <= 0, 144, 165)
-        m2["b"] = np.where(m2["val"] <= 0, 255, 0)
-        m2["a"] = 170
-
+        m2["val"] = m2["d_cold"].fillna(0.0)
+        m2["radius"] = (12000 + m2["val"].abs() * 3500).astype(float)
+        # Typically cold extremes decline (negative) — color negatives as blue, positives as red
+        m2["fill"] = m2["val"].apply(lambda x: _color_bin(x, [30, 144, 255], [255, 60, 0]))
         m2["weight"] = m2["val"].abs().astype(float)
 
         layers.append(
@@ -868,8 +897,8 @@ elif page == "Maps":
                 get_position="[lon, lat]",
                 get_radius="radius",
                 radius_min_pixels=6,
-                radius_max_pixels=60,
-                get_fill_color="[r, g, b, a]",
+                radius_max_pixels=70,
+                get_fill_color="fill",
                 pickable=True,
                 auto_highlight=True,
             )
@@ -880,20 +909,29 @@ elif page == "Maps":
                 data=m2,
                 get_position="[lon, lat]",
                 get_weight="weight",
-                radiusPixels=90,
+                radiusPixels=110,
             )
         )
-        tooltip = {"html": "<b>{city}</b><br/>Δ cold extremes: {val} days/yr", "style": {"backgroundColor": "white"}}
-        title = "Change in cold-extreme frequency (1991–2020 vs 1961–1990)"
+        tooltip = {
+            "html": "<b>{city}</b><br/>Δ cold extremes: {d_cold} days/year",
+            "style": {"backgroundColor": "white"},
+        }
 
     st.markdown(f"### {title}")
+
     deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/light-v10",
+        map_style=map_style,  # CARTO style -> basemap loads without token
         initial_view_state=view_state,
         layers=layers,
         tooltip=tooltip,
     )
     st.pydeck_chart(deck, use_container_width=True)
+
+    # Optional: show the underlying metrics driving the map (small, not table-heavy)
+    with st.expander("Show map metrics"):
+        show_cols = ["city", "lat", "lon", "slope_c_per_decade", "slope_mm_per_decade", "d_hot", "d_cold"]
+        st.dataframe(m[show_cols].sort_values("city"), use_container_width=True)
+
 
 
 elif page == "Download":
