@@ -3,9 +3,10 @@
 An interactive climate analytics project examining 80 years of city-level climate data across Canada, with a focus on long-run temperature trends, seasonality shifts, extremes, and spatial patterns.
 The project combines rigorous climate metrics with modern interactive visualization to support exploratory analysis and communication.
 
-🚀 Live Interactive Dashboard
+## 🚀 Live Interactive Dashboard
 
-👉 Open the Streamlit Dashboard
+👉 **[Open the Streamlit Dashboard](https://canada-climate-80yrs-6u55vcsxoekyqoq4jh4mzk.streamlit.app/)**
+
 
 The dashboard allows users to:
 
