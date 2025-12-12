@@ -1,299 +1,312 @@
-# app.py — Canada Climate Dashboard (1940–Present)
-# Streamlit app designed to run on Streamlit Community Cloud with minimal dependencies.
-# Uses: streamlit, pandas, numpy, matplotlib, pydeck (bundled with Streamlit)
-
-import os
-from pathlib import Path
-import re
 import math
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib.pyplot as plt
+import altair as alt
 import pydeck as pdk
 
 
 # -----------------------------
-# App config + styling
+# Page config + styling
 # -----------------------------
 st.set_page_config(
     page_title="Canada Climate Dashboard",
-    page_icon="🇨🇦",
+    page_icon="🌡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-CUSTOM_CSS = """
-<style>
-/* Layout tightening */
-.block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+st.markdown(
+    """
+    <style>
+      .block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
+      [data-testid="stSidebar"] {min-width: 320px; max-width: 380px;}
+      .kpi {border: 1px solid rgba(0,0,0,0.08); border-radius: 14px; padding: 14px;}
+      .muted {color: rgba(0,0,0,0.55); font-size: 0.95rem;}
+      .small {font-size: 0.9rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-/* Sidebar headings */
-section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3 { margin-top: 0.6rem; }
-
-/* Card-like metric boxes */
-div[data-testid="metric-container"] {
-    background: rgba(255,255,255,0.03);
-    border: 1px solid rgba(255,255,255,0.08);
-    padding: 12px 12px 10px 12px;
-    border-radius: 14px;
-}
-
-/* Make tables feel cleaner */
-thead tr th { background: rgba(255,255,255,0.03) !important; }
-
-/* Small help text tone */
-.small-note { color: rgba(255,255,255,0.65); font-size: 0.9rem; }
-
-/* Section titles */
-.section-title { font-size: 1.2rem; font-weight: 700; margin: 0.4rem 0 0.8rem 0; }
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # -----------------------------
-# Paths + city geocoding
+# Robust paths
 # -----------------------------
 REPO_DIR = Path(__file__).resolve().parent
 DATA_DIR = REPO_DIR / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 
+# Expected (from your notebooks)
+TIDY_PARQUET = PROCESSED_DIR / "climate_daily_tidy.parquet"
+MONTHLY_PARQUET = PROCESSED_DIR / "climate_monthly.parquet"
+YEARLY_PARQUET = PROCESSED_DIR / "climate_yearly.parquet"
+
+# Raw fallback
 RAW_CANDIDATES = [
     RAW_DIR / "canadian_climate_daily.csv",
-    RAW_DIR / "canadian_climate_daily.csv",  # keep as fallback if naming changes
+    RAW_DIR / "canadian_climate_daily.csv",  # keeping your naming pattern
 ]
-
-TIDY_PATH = PROCESSED_DIR / "climate_daily_tidy.parquet"
-MONTHLY_PATH = PROCESSED_DIR / "climate_monthly.parquet"
-YEARLY_PATH = PROCESSED_DIR / "climate_yearly.parquet"
-
-CITY_COORDS = {
-    "CALGARY":    (51.0447, -114.0719),
-    "EDMONTON":   (53.5461, -113.4938),
-    "HALIFAX":    (44.6488,  -63.5752),
-    "MONCTON":    (46.0878,  -64.7782),
-    "MONTREAL":   (45.5019,  -73.5674),
-    "OTTAWA":     (45.4215,  -75.6972),
-    "QUEBEC":     (46.8139,  -71.2080),   # Québec City
-    "SASKATOON":  (52.1332, -106.6700),
-    "STJOHNS":    (47.5615,  -52.7126),   # St. John's
-    "TORONTO":    (43.6532,  -79.3832),
-    "VANCOUVER":  (49.2827, -123.1207),
-    "WHITEHORSE": (60.7212, -135.0568),
-    "WINNIPEG":   (49.8951,  -97.1384),
-}
-
-# -----------------------------
-# Utility functions
-# -----------------------------
-def _find_raw_csv() -> Path:
-    for p in RAW_CANDIDATES:
-        if p.exists():
-            return p
+RAW_PATH = next((p for p in RAW_CANDIDATES if p.exists()), None)
+if RAW_PATH is None and RAW_DIR.exists():
     csvs = sorted(RAW_DIR.glob("*.csv"))
     if csvs:
-        return csvs[0]
-    raise FileNotFoundError(f"No raw CSV found in {RAW_DIR}. Expected one of: {RAW_CANDIDATES}")
+        RAW_PATH = csvs[0]
 
-def _standardize_city(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.upper().str.strip().str.replace(r"\s+", " ", regex=True)
 
-def _ols_slope_per_decade(year: np.ndarray, y: np.ndarray) -> float:
-    # simple OLS slope (y ~ a + b*year), return b*10
-    year = np.asarray(year, dtype=float)
+# -----------------------------
+# Utilities
+# -----------------------------
+CITY_COORDS = {
+    "CALGARY": (51.0447, -114.0719),
+    "EDMONTON": (53.5461, -113.4938),
+    "HALIFAX": (44.6488, -63.5752),
+    "MONCTON": (46.0878, -64.7782),
+    "MONTREAL": (45.5019, -73.5674),
+    "OTTAWA": (45.4215, -75.6972),
+    "QUEBEC": (46.8139, -71.2080),
+    "SASKATOON": (52.1332, -106.6700),
+    "STJOHNS": (47.5615, -52.7126),
+    "TORONTO": (43.6532, -79.3832),
+    "VANCOUVER": (49.2827, -123.1207),
+    "WHITEHORSE": (60.7212, -135.0568),
+    "WINNIPEG": (49.8951, -97.1384),
+}
+
+def _safe_to_datetime(s):
+    return pd.to_datetime(s, errors="coerce", utc=False)
+
+def _ols_slope_ci(x, y):
+    """Return slope per year and ~95% CI (normal approx)."""
+    x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
-    m = np.isfinite(year) & np.isfinite(y)
-    year = year[m]
-    y = y[m]
-    if year.size < 10:
-        return np.nan
-    x = year - year.mean()
-    denom = np.sum(x * x)
-    if denom == 0:
-        return np.nan
-    b = np.sum(x * (y - y.mean())) / denom
-    return float(b * 10.0)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    n = len(x)
+    if n < 10:
+        return None
 
-def _diverging_color(val: float, vmin: float, vmax: float) -> list:
-    # returns [r,g,b,alpha] for pydeck, simple diverging around 0
-    if not np.isfinite(val):
-        return [160, 160, 160, 140]
-    if vmax <= 0 and vmin <= 0:
-        t = 0.0 if vmin == vmax else (val - vmin) / (vmax - vmin)
-        t = float(np.clip(t, 0, 1))
-        return [40, int(80 + 120 * t), int(120 + 110 * t), 200]
-    if vmin >= 0 and vmax >= 0:
-        t = 0.0 if vmin == vmax else (val - vmin) / (vmax - vmin)
-        t = float(np.clip(t, 0, 1))
-        return [int(120 + 110 * t), int(80 + 90 * (1 - t)), 40, 200]
+    x0 = x - x.mean()
+    b = np.sum(x0 * (y - y.mean())) / np.sum(x0 ** 2)
+    a = y.mean() - b * x.mean()
 
-    # diverging around zero: negative -> blue, positive -> red
-    max_abs = max(abs(vmin), abs(vmax), 1e-9)
-    t = float(np.clip(val / max_abs, -1, 1))
-    if t < 0:
-        u = abs(t)
-        return [60, int(110 + 80 * (1 - u)), int(180 + 50 * u), 210]
-    else:
-        u = t
-        return [int(180 + 50 * u), int(110 + 80 * (1 - u)), 60, 210]
+    yhat = a + b * x
+    resid = y - yhat
+    s2 = np.sum(resid ** 2) / (n - 2)
+    se_b = np.sqrt(s2 / np.sum(x0 ** 2))
 
-def _safe_write_parquet(df: pd.DataFrame, path: Path) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(path, index=False)
-    except Exception:
-        # On Streamlit Cloud, filesystem is writable but not guaranteed. Failing to write is OK.
-        pass
+    z = 1.96
+    lo, hi = b - z * se_b, b + z * se_b
+    return {"n": n, "slope_per_year": b, "lo": lo, "hi": hi}
 
-# -----------------------------
-# Build processed datasets (if missing)
-# -----------------------------
-def build_processed(raw_path: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(raw_path)
-
-    # Date
-    if "LOCAL_DATE" not in df.columns:
-        raise ValueError("Expected column LOCAL_DATE in raw CSV.")
-    df["LOCAL_DATE"] = pd.to_datetime(df["LOCAL_DATE"], errors="coerce")
-    if df["LOCAL_DATE"].isna().any():
-        bad = int(df["LOCAL_DATE"].isna().sum())
-        raise ValueError(f"LOCAL_DATE parsing failed for {bad} rows.")
-
-    # Wide -> tidy (expects MEAN_TEMPERATURE_CITY, TOTAL_PRECIPITATION_CITY)
-    pat = re.compile(r"^(MEAN_TEMPERATURE|TOTAL_PRECIPITATION)_(.+)$")
-    value_cols = [c for c in df.columns if c != "LOCAL_DATE" and pat.match(c)]
-    if not value_cols:
-        raise ValueError("No metric columns found. Expected patterns like MEAN_TEMPERATURE_CITYNAME.")
-
-    long = df.melt(
-        id_vars=["LOCAL_DATE"],
-        value_vars=value_cols,
-        var_name="series",
-        value_name="value",
-    )
-    long[["metric", "city"]] = long["series"].str.extract(r"^(MEAN_TEMPERATURE|TOTAL_PRECIPITATION)_(.+)$")
-    long = long.drop(columns=["series"])
-
-    tidy = (
-        long.pivot_table(
-            index=["LOCAL_DATE", "city"],
-            columns="metric",
-            values="value",
-            aggfunc="first",
+def _get_city_latlon(df_daily):
+    # If dataset has coordinates, use them; otherwise fall back to CITY_COORDS.
+    lat_cols = [c for c in df_daily.columns if c.lower() in ("lat", "latitude")]
+    lon_cols = [c for c in df_daily.columns if c.lower() in ("lon", "lng", "longitude")]
+    if lat_cols and lon_cols:
+        latc, lonc = lat_cols[0], lon_cols[0]
+        coords = (
+            df_daily.groupby("city", as_index=False)
+            .agg(lat=(latc, "median"), lon=(lonc, "median"))
         )
-        .reset_index()
-        .rename(
-            columns={
+        coords["lat"] = pd.to_numeric(coords["lat"], errors="coerce")
+        coords["lon"] = pd.to_numeric(coords["lon"], errors="coerce")
+        return coords
+
+    coords = pd.DataFrame(
+        [{"city": k, "lat": v[0], "lon": v[1]} for k, v in CITY_COORDS.items()]
+    )
+    return coords
+
+
+# -----------------------------
+# Load / build data (cached)
+# -----------------------------
+@st.cache_data(show_spinner=True)
+def load_data():
+    # Preferred: processed parquet
+    if TIDY_PARQUET.exists() and MONTHLY_PARQUET.exists() and YEARLY_PARQUET.exists():
+        df_daily = pd.read_parquet(TIDY_PARQUET)
+        df_monthly = pd.read_parquet(MONTHLY_PARQUET)
+        df_yearly = pd.read_parquet(YEARLY_PARQUET)
+        source = "processed_parquet"
+    else:
+        if RAW_PATH is None:
+            raise FileNotFoundError(
+                "Could not find raw CSV in data/raw. Ensure the repo contains data/raw/*.csv "
+                "or commit processed parquet files to data/processed."
+            )
+        df = pd.read_csv(RAW_PATH)
+        if "LOCAL_DATE" not in df.columns:
+            raise ValueError("Expected LOCAL_DATE column in raw CSV.")
+
+        df["LOCAL_DATE"] = _safe_to_datetime(df["LOCAL_DATE"])
+        if df["LOCAL_DATE"].isna().any():
+            raise ValueError("LOCAL_DATE parsing failed for some rows.")
+
+        # Melt wide -> tidy for metrics
+        # expected column patterns: MEAN_TEMPERATURE_CITY, TOTAL_PRECIPITATION_CITY
+        value_cols = [c for c in df.columns if c != "LOCAL_DATE" and "_" in c]
+        # Keep only two metrics if present
+        keep = []
+        for c in value_cols:
+            uc = c.upper()
+            if uc.startswith("MEAN_TEMPERATURE_") or uc.startswith("TOTAL_PRECIPITATION_"):
+                keep.append(c)
+
+        if not keep:
+            raise ValueError(
+                "Raw CSV does not look like expected wide city columns "
+                "(MEAN_TEMPERATURE_* / TOTAL_PRECIPITATION_*)."
+            )
+
+        long = df.melt(
+            id_vars=["LOCAL_DATE"], value_vars=keep,
+            var_name="series", value_name="value"
+        )
+        # Split series -> metric + city
+        parts = long["series"].str.split("_", n=2, expand=True)
+        # Rebuild robustly because city names can contain underscores in some datasets
+        # series like: MEAN_TEMPERATURE_TORONTO
+        metric = long["series"].str.extract(r"^(MEAN_TEMPERATURE|TOTAL_PRECIPITATION)")[0]
+        city = long["series"].str.replace(r"^(MEAN_TEMPERATURE|TOTAL_PRECIPITATION)_", "", regex=True)
+
+        long["metric"] = metric
+        long["city"] = city
+
+        tidy = (
+            long.pivot_table(index=["LOCAL_DATE", "city"], columns="metric", values="value", aggfunc="first")
+            .reset_index()
+            .rename(columns={
                 "LOCAL_DATE": "local_date",
                 "MEAN_TEMPERATURE": "mean_temperature",
                 "TOTAL_PRECIPITATION": "total_precipitation",
-            }
+            })
         )
-    )
 
-    tidy["city"] = _standardize_city(tidy["city"])
-    tidy["local_date"] = pd.to_datetime(tidy["local_date"])
-    tidy["mean_temperature"] = pd.to_numeric(tidy["mean_temperature"], errors="coerce")
-    tidy["total_precipitation"] = pd.to_numeric(tidy["total_precipitation"], errors="coerce")
+        tidy["city"] = tidy["city"].astype(str).str.upper().str.strip()
+        tidy["local_date"] = _safe_to_datetime(tidy["local_date"]).dt.tz_localize(None)
+        tidy["mean_temperature"] = pd.to_numeric(tidy["mean_temperature"], errors="coerce")
+        tidy["total_precipitation"] = pd.to_numeric(tidy["total_precipitation"], errors="coerce")
 
-    tidy["year"] = tidy["local_date"].dt.year
-    tidy["month"] = tidy["local_date"].dt.month
-    tidy["dayofyear"] = tidy["local_date"].dt.dayofyear
+        tidy["year"] = tidy["local_date"].dt.year
+        tidy["month"] = tidy["local_date"].dt.month
+        tidy["dayofyear"] = tidy["local_date"].dt.dayofyear
 
-    monthly = (
-        tidy.groupby(["city", "year", "month"], as_index=False)
-        .agg(
-            mean_temperature=("mean_temperature", "mean"),
-            total_precipitation=("total_precipitation", "sum"),
-            n_obs_temp=("mean_temperature", "count"),
-            n_obs_precip=("total_precipitation", "count"),
+        df_daily = tidy
+
+        df_monthly = (
+            df_daily.groupby(["city", "year", "month"], as_index=False)
+            .agg(
+                mean_temperature=("mean_temperature", "mean"),
+                total_precipitation=("total_precipitation", "sum"),
+                n_obs_temp=("mean_temperature", "count"),
+                n_obs_precip=("total_precipitation", "count"),
+            )
         )
-    )
 
-    yearly = (
-        tidy.groupby(["city", "year"], as_index=False)
-        .agg(
-            mean_temperature=("mean_temperature", "mean"),
-            total_precipitation=("total_precipitation", "sum"),
-            n_obs_temp=("mean_temperature", "count"),
-            n_obs_precip=("total_precipitation", "count"),
+        df_yearly = (
+            df_daily.groupby(["city", "year"], as_index=False)
+            .agg(
+                mean_temperature=("mean_temperature", "mean"),
+                total_precipitation=("total_precipitation", "sum"),
+                n_obs_temp=("mean_temperature", "count"),
+                n_obs_precip=("total_precipitation", "count"),
+            )
         )
-    )
+        source = "raw_csv"
 
-    _safe_write_parquet(tidy, TIDY_PATH)
-    _safe_write_parquet(monthly, MONTHLY_PATH)
-    _safe_write_parquet(yearly, YEARLY_PATH)
+    # Standardize types
+    df_daily = df_daily.copy()
+    df_daily["local_date"] = _safe_to_datetime(df_daily["local_date"]).dt.tz_localize(None)
+    df_daily["city"] = df_daily["city"].astype(str).str.upper().str.strip()
 
-    return tidy, monthly, yearly
+    # Ensure derived columns exist
+    if "year" not in df_daily.columns:
+        df_daily["year"] = df_daily["local_date"].dt.year
+    if "month" not in df_daily.columns:
+        df_daily["month"] = df_daily["local_date"].dt.month
+    if "dayofyear" not in df_daily.columns:
+        df_daily["dayofyear"] = df_daily["local_date"].dt.dayofyear
+
+    # Metadata
+    meta = {
+        "source": source,
+        "date_min": df_daily["local_date"].min(),
+        "date_max": df_daily["local_date"].max(),
+        "cities": sorted(df_daily["city"].dropna().unique().tolist()),
+    }
+    return df_daily, df_monthly, df_yearly, meta
+
 
 @st.cache_data(show_spinner=False)
-def load_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict]:
-    status = {
-        "repo_dir": str(REPO_DIR),
-        "raw_dir": str(RAW_DIR),
-        "processed_dir": str(PROCESSED_DIR),
-        "raw_path": None,
-        "used_parquet": False,
-        "built_processed": False,
-        "tidy_path": str(TIDY_PATH),
-        "monthly_path": str(MONTHLY_PATH),
-        "yearly_path": str(YEARLY_PATH),
-    }
-
-    raw_path = _find_raw_csv()
-    status["raw_path"] = str(raw_path)
-
-    if TIDY_PATH.exists() and MONTHLY_PATH.exists() and YEARLY_PATH.exists():
-        tidy = pd.read_parquet(TIDY_PATH)
-        monthly = pd.read_parquet(MONTHLY_PATH)
-        yearly = pd.read_parquet(YEARLY_PATH)
-        status["used_parquet"] = True
-        return tidy, monthly, yearly, status
-
-    tidy, monthly, yearly = build_processed(raw_path)
-    status["built_processed"] = True
-    return tidy, monthly, yearly, status
-
-# -----------------------------
-# Derived analytics
-# -----------------------------
-def compute_annual_metrics(df_daily: pd.DataFrame) -> pd.DataFrame:
-    d = df_daily.copy()
-    d["city"] = _standardize_city(d["city"])
-    d["local_date"] = pd.to_datetime(d["local_date"])
-    d["year"] = d["local_date"].dt.year
-
+def compute_city_year_metrics(df_daily: pd.DataFrame, min_days_per_year: int):
     annual = (
-        d.groupby(["city", "year"], as_index=False)
+        df_daily.groupby(["city", "year"], as_index=False)
         .agg(
             mean_temp=("mean_temperature", "mean"),
+            p50_temp=("mean_temperature", "median"),
+            sd_temp=("mean_temperature", "std"),
             total_precip=("total_precipitation", "sum"),
+            wet_days=("total_precipitation", lambda s: int((s > 0).sum())),
             n_temp=("mean_temperature", "count"),
             n_precip=("total_precipitation", "count"),
-            wet_days=("total_precipitation", lambda s: int((pd.to_numeric(s, errors="coerce") > 0).sum())),
         )
     )
+    annual["temp_ok"] = annual["n_temp"] >= min_days_per_year
+    annual["precip_ok"] = annual["n_precip"] >= min_days_per_year
+    annual["wet_day_ratio"] = (annual["wet_days"] / annual["n_precip"]).replace([np.inf, -np.inf], np.nan)
     return annual
 
-def compute_extremes(df_daily: pd.DataFrame, baseline: tuple[int, int], min_days_per_year: int) -> pd.DataFrame:
-    d = df_daily.copy()
-    d["city"] = _standardize_city(d["city"])
-    d["local_date"] = pd.to_datetime(d["local_date"])
-    d["year"] = d["local_date"].dt.year
 
-    base = d[(d["year"] >= baseline[0]) & (d["year"] <= baseline[1])].copy()
+@st.cache_data(show_spinner=False)
+def compute_trends(annual: pd.DataFrame):
+    cities = sorted(annual["city"].unique())
+    rows_t = []
+    rows_p = []
+    for c in cities:
+        sub_t = annual[(annual["city"] == c) & (annual["temp_ok"])].sort_values("year")
+        r = _ols_slope_ci(sub_t["year"], sub_t["mean_temp"])
+        if r:
+            rows_t.append({
+                "city": c,
+                "n": r["n"],
+                "slope_c_per_decade": r["slope_per_year"] * 10,
+                "ci_lo": r["lo"] * 10,
+                "ci_hi": r["hi"] * 10,
+            })
+
+        sub_p = annual[(annual["city"] == c) & (annual["precip_ok"])].sort_values("year")
+        r2 = _ols_slope_ci(sub_p["year"], sub_p["total_precip"])
+        if r2:
+            rows_p.append({
+                "city": c,
+                "n": r2["n"],
+                "slope_mm_per_decade": r2["slope_per_year"] * 10,
+                "ci_lo": r2["lo"] * 10,
+                "ci_hi": r2["hi"] * 10,
+            })
+    return pd.DataFrame(rows_t), pd.DataFrame(rows_p)
+
+
+@st.cache_data(show_spinner=False)
+def compute_extremes(df_daily: pd.DataFrame, baseline=(1961, 1990), q_lo=0.05, q_hi=0.95, min_days_per_year=300):
+    y0, y1 = baseline
+    base = df_daily[(df_daily["year"] >= y0) & (df_daily["year"] <= y1)].copy()
+
     thresholds = (
         base.groupby("city")["mean_temperature"]
-        .quantile([0.05, 0.95])
+        .quantile([q_lo, q_hi])
         .unstack()
-        .rename(columns={0.05: "t_p05", 0.95: "t_p95"})
+        .rename(columns={q_lo: "t_lo", q_hi: "t_hi"})
         .reset_index()
     )
-
-    d2 = d.merge(thresholds, on="city", how="left")
-    d2["cold_extreme"] = d2["mean_temperature"] <= d2["t_p05"]
-    d2["hot_extreme"] = d2["mean_temperature"] >= d2["t_p95"]
+    d2 = df_daily.merge(thresholds, on="city", how="left")
+    d2["cold_extreme"] = d2["mean_temperature"] <= d2["t_lo"]
+    d2["hot_extreme"] = d2["mean_temperature"] >= d2["t_hi"]
 
     ex = (
         d2.groupby(["city", "year"], as_index=False)
@@ -303,439 +316,599 @@ def compute_extremes(df_daily: pd.DataFrame, baseline: tuple[int, int], min_days
             n_temp=("mean_temperature", "count"),
         )
     )
-    ex["temp_ok"] = ex["n_temp"] >= int(min_days_per_year)
-    return ex
+    ex["year_ok"] = ex["n_temp"] >= min_days_per_year
+    return thresholds, ex
 
-def attach_coords(df_city: pd.DataFrame) -> pd.DataFrame:
-    out = df_city.copy()
-    out["city"] = _standardize_city(out["city"])
-    out["lat"] = out["city"].map(lambda c: CITY_COORDS.get(c, (np.nan, np.nan))[0])
-    out["lon"] = out["city"].map(lambda c: CITY_COORDS.get(c, (np.nan, np.nan))[1])
-    return out
-
-def compute_map_layers(
-    annual: pd.DataFrame,
-    extremes: pd.DataFrame,
-    year_range: tuple[int, int],
-    min_days_per_year: int,
-    baseline: tuple[int, int],
-    recent: tuple[int, int],
-) -> pd.DataFrame:
-    a = annual.copy()
-    a = a[(a["year"] >= year_range[0]) & (a["year"] <= year_range[1])].copy()
-    a["temp_ok"] = a["n_temp"] >= int(min_days_per_year)
-
-    # Trend per city (using temp_ok only)
-    rows = []
-    for city, g in a[a["temp_ok"]].groupby("city"):
-        g = g.sort_values("year")
-        slope_dec = _ols_slope_per_decade(g["year"].to_numpy(), g["mean_temp"].to_numpy())
-        rows.append({"city": city, "warming_trend_decade": slope_dec})
-    trend = pd.DataFrame(rows)
-
-    # Extreme frequency change: baseline vs recent (avg days/year)
-    e = extremes.copy()
-    e = e[(e["year"] >= year_range[0]) & (e["year"] <= year_range[1])].copy()
-    e_ok = e[e["temp_ok"]].copy()
-
-    def _period_mean(df, y0, y1, col):
-        sub = df[(df["year"] >= y0) & (df["year"] <= y1)]
-        return sub.groupby("city", as_index=False)[col].mean().rename(columns={col: f"{col}_mean_{y0}_{y1}"})
-
-    hot_b = _period_mean(e_ok, baseline[0], baseline[1], "hot_days")
-    hot_r = _period_mean(e_ok, recent[0], recent[1], "hot_days")
-    cold_b = _period_mean(e_ok, baseline[0], baseline[1], "cold_days")
-    cold_r = _period_mean(e_ok, recent[0], recent[1], "cold_days")
-
-    delta = hot_b.merge(hot_r, on="city", how="outer").merge(cold_b, on="city", how="outer").merge(cold_r, on="city", how="outer")
-    delta["delta_hot_days"] = delta[f"hot_days_mean_{recent[0]}_{recent[1]}"] - delta[f"hot_days_mean_{baseline[0]}_{baseline[1]}"]
-    delta["delta_cold_days"] = delta[f"cold_days_mean_{recent[0]}_{recent[1]}"] - delta[f"cold_days_mean_{baseline[0]}_{baseline[1]}"]
-
-    out = trend.merge(delta[["city", "delta_hot_days", "delta_cold_days"]], on="city", how="outer")
-    out = attach_coords(out)
-    return out
-
-# -----------------------------
-# Map rendering (pydeck)
-# -----------------------------
-def make_pydeck_map(df_points: pd.DataFrame, value_col: str, title: str, selected_cities: list[str] | None):
-    d = df_points.dropna(subset=["lat", "lon"]).copy()
-    d["city"] = _standardize_city(d["city"])
-    if selected_cities:
-        sel = [_standardize_city(pd.Series(selected_cities)).iloc[i] for i in range(len(selected_cities))]
-        d_view = d[d["city"].isin(sel)].copy()
-    else:
-        d_view = d.copy()
-
-    # fallback: show everything if filter empties
-    if d_view.empty:
-        d_view = d.copy()
-
-    vals = d_view[value_col].to_numpy(dtype=float)
-    finite = vals[np.isfinite(vals)]
-    vmin = float(np.min(finite)) if finite.size else -1.0
-    vmax = float(np.max(finite)) if finite.size else 1.0
-
-    # marker size: emphasize magnitude, but keep readable
-    max_abs = float(np.max(np.abs(finite))) if finite.size else 1.0
-    d_view["radius"] = 22000 * (0.35 + 0.65 * (np.abs(d_view[value_col].fillna(0.0)) / (max_abs + 1e-9)))
-    d_view["color"] = d_view[value_col].apply(lambda v: _diverging_color(float(v) if pd.notna(v) else np.nan, vmin, vmax))
-
-    # view state (auto-fit-ish)
-    center_lat = float(d_view["lat"].mean())
-    center_lon = float(d_view["lon"].mean())
-    # rough zoom heuristic
-    lon_span = float(d_view["lon"].max() - d_view["lon"].min()) if len(d_view) > 1 else 6.0
-    lat_span = float(d_view["lat"].max() - d_view["lat"].min()) if len(d_view) > 1 else 4.0
-    span = max(lon_span, lat_span, 2.0)
-    zoom = float(np.clip(3.8 - math.log(span + 1e-9, 2), 2.2, 6.5))
-
-    view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom, pitch=0, bearing=0)
-
-    scatter = pdk.Layer(
-        "ScatterplotLayer",
-        data=d_view,
-        get_position=["lon", "lat"],
-        get_radius="radius",
-        get_fill_color="color",
-        get_line_color=[20, 20, 20, 200],
-        line_width_min_pixels=1,
-        pickable=True,
-        auto_highlight=True,
-    )
-
-    labels = pdk.Layer(
-        "TextLayer",
-        data=d_view,
-        get_position=["lon", "lat"],
-        get_text="city",
-        get_size=14,
-        get_color=[255, 255, 255, 220],
-        get_angle=0,
-        get_text_anchor="start",
-        get_alignment_baseline="bottom",
-        pickable=False,
-    )
-
-    tooltip = {
-        "html": f"<b>{{city}}</b><br/>{title}: <b>{{{value_col}}}</b>",
-        "style": {"backgroundColor": "rgba(20,20,20,0.92)", "color": "white"},
-    }
-
-    deck = pdk.Deck(
-        map_style="mapbox://styles/mapbox/dark-v11",
-        initial_view_state=view_state,
-        layers=[scatter, labels],
-        tooltip=tooltip,
-    )
-    return deck
-
-# -----------------------------
-# Load data
-# -----------------------------
-df_daily, df_monthly, df_yearly, status = load_data()
-
-# defensive typing
-df_daily = df_daily.copy()
-df_daily["city"] = _standardize_city(df_daily["city"])
-df_daily["local_date"] = pd.to_datetime(df_daily["local_date"])
 
 # -----------------------------
 # Sidebar controls
 # -----------------------------
-st.sidebar.title("Canada Climate Dashboard")
-st.sidebar.caption("1940–Present • City-level daily → monthly/yearly rollups")
+df_daily, df_monthly, df_yearly, meta = load_data()
+
+st.sidebar.markdown("## Canada Climate Dashboard")
+st.sidebar.markdown(
+    f"<div class='muted'>"
+    f"{meta['date_min'].date()} → {meta['date_max'].date()} • City-level daily → monthly/yearly rollups"
+    f"</div>",
+    unsafe_allow_html=True
+)
 
 with st.sidebar.expander("Data status", expanded=False):
-    st.write("Repo:", status["repo_dir"])
-    st.write("Raw:", status["raw_path"])
-    st.write("Processed dir:", status["processed_dir"])
-    st.write("Loaded parquet:", status["used_parquet"])
-    st.write("Built processed:", status["built_processed"])
-    st.write("Tidy parquet exists:", TIDY_PATH.exists())
-    st.write("Monthly parquet exists:", MONTHLY_PATH.exists())
-    st.write("Yearly parquet exists:", YEARLY_PATH.exists())
+    st.write(f"**Source:** {meta['source']}")
+    st.write(f"**Repo path:** `{REPO_DIR}`")
+    st.write(f"**Raw path:** `{RAW_PATH}`" if RAW_PATH else "**Raw path:** not found")
+    st.write(f"**Processed parquet present:** {TIDY_PARQUET.exists() and MONTHLY_PARQUET.exists() and YEARLY_PARQUET.exists()}")
 
-st.sidebar.markdown("### Navigate")
-page = st.sidebar.radio(
-    "Go to",
-    ["Overview", "Trends", "Extremes", "Maps", "Download"],
-    index=0,
-    label_visibility="collapsed",
-)
+page = st.sidebar.radio("Navigate", ["Overview", "Trends", "Extremes", "Maps", "Download"], index=0)
 
-all_cities = sorted(df_daily["city"].unique().tolist())
-default_cities = all_cities  # important: show many points by default
+cities_all = meta["cities"]
+default_cities = [c for c in ["TORONTO", "VANCOUVER", "CALGARY", "MONTREAL"] if c in cities_all] or cities_all[:3]
+cities_sel = st.sidebar.multiselect("Cities", cities_all, default=default_cities)
 
-selected_cities = st.sidebar.multiselect(
-    "Cities",
-    options=all_cities,
-    default=default_cities,
-)
+year_min, year_max = int(df_daily["year"].min()), int(df_daily["year"].max())
+year_range = st.sidebar.slider("Year range", min_value=year_min, max_value=year_max, value=(max(year_min, 1940), year_max))
 
-min_year = int(df_daily["local_date"].dt.year.min())
-max_year = int(df_daily["local_date"].dt.year.max())
-year_range = st.sidebar.slider("Year range", min_value=min_year, max_value=max_year, value=(min_year, max_year), step=1)
+min_days = st.sidebar.slider("Coverage threshold (days/year)", min_value=200, max_value=365, value=300, step=5)
 
-min_days_per_year = st.sidebar.slider("Coverage threshold (days/year)", min_value=200, max_value=365, value=300, step=5)
+baseline_label = st.sidebar.selectbox("Baseline period", ["1961-1990", "1991-2020"], index=0)
+baseline = (1961, 1990) if baseline_label == "1961-1990" else (1991, 2020)
 
-baseline_label = st.sidebar.selectbox("Baseline period", ["1961–1990", "1951–1980", "1971–2000"], index=0)
-baseline_map = {"1961–1990": (1961, 1990), "1951–1980": (1951, 1980), "1971–2000": (1971, 2000)}
-BASELINE = baseline_map[baseline_label]
-RECENT = (1991, 2020)
+# Filtered daily
+d = df_daily[
+    (df_daily["city"].isin(cities_sel)) &
+    (df_daily["year"] >= year_range[0]) &
+    (df_daily["year"] <= year_range[1])
+].copy()
 
-# filter daily for pages
-d = df_daily.copy()
-d = d[(d["local_date"].dt.year >= year_range[0]) & (d["local_date"].dt.year <= year_range[1])]
-if selected_cities:
-    d = d[d["city"].isin([c.upper().strip() for c in selected_cities])]
+annual = compute_city_year_metrics(df_daily, min_days_per_year=min_days)
+annual_f = annual[
+    (annual["city"].isin(cities_sel)) &
+    (annual["year"] >= year_range[0]) &
+    (annual["year"] <= year_range[1])
+].copy()
 
-annual = compute_annual_metrics(d)
-extremes = compute_extremes(d, baseline=BASELINE, min_days_per_year=min_days_per_year)
+temp_trends, precip_trends = compute_trends(annual)
+thresholds, extremes = compute_extremes(df_daily, baseline=baseline, min_days_per_year=min_days)
+
 
 # -----------------------------
-# Top header
+# Header KPIs
 # -----------------------------
-st.markdown("## Canada Climate (1940–Present)")
-st.markdown('<div class="small-note">Daily mean temperature and total precipitation, aggregated to annual metrics with coverage checks.</div>', unsafe_allow_html=True)
+top_left, top_right = st.columns([1.35, 1])
+
+with top_left:
+    st.title("Canada Climate Dashboard")
+    st.markdown(
+        "<div class='muted'>A compact analytics layer for long-run temperature, precipitation, and extremes, using coverage-aware rollups.</div>",
+        unsafe_allow_html=True
+    )
+
+with top_right:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("<div class='kpi'>", unsafe_allow_html=True)
+        st.metric("Cities selected", len(cities_sel))
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown("<div class='kpi'>", unsafe_allow_html=True)
+        st.metric("Years", f"{year_range[0]}–{year_range[1]}")
+        st.markdown("</div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown("<div class='kpi'>", unsafe_allow_html=True)
+        st.metric("Coverage gate", f"{min_days} days/yr")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+st.divider()
+
 
 # -----------------------------
-# Overview
+# Altair theme defaults
+# -----------------------------
+alt.data_transformers.disable_max_rows()
+
+def a_line(df, x, y, color, tooltip, title):
+    return (
+        alt.Chart(df)
+        .mark_line()
+        .encode(
+            x=alt.X(x, title=None),
+            y=alt.Y(y, title=None),
+            color=alt.Color(color, legend=alt.Legend(orient="bottom", columns=4)),
+            tooltip=tooltip,
+        )
+        .properties(title=title, height=330)
+    )
+
+def a_heatmap(df, x, y, v, title):
+    return (
+        alt.Chart(df)
+        .mark_rect()
+        .encode(
+            x=alt.X(x, title=None),
+            y=alt.Y(y, title=None),
+            color=alt.Color(v, title=None),
+            tooltip=[x, y, v],
+        )
+        .properties(title=title, height=350)
+    )
+
+
+# -----------------------------
+# Pages
 # -----------------------------
 if page == "Overview":
-    left, mid, right = st.columns(3)
-
-    n_cities = int(d["city"].nunique())
-    n_rows = int(len(d))
-    date_min = d["local_date"].min().date() if len(d) else None
-    date_max = d["local_date"].max().date() if len(d) else None
-
-    with left:
-        st.metric("Cities in view", f"{n_cities}")
-    with mid:
-        st.metric("Daily rows in view", f"{n_rows:,}")
-    with right:
-        st.metric("Date range", f"{date_min} → {date_max}")
-
-    st.markdown('<div class="section-title">Quick health checks</div>', unsafe_allow_html=True)
-
-    city_summary = (
-        d.groupby("city", as_index=False)
-        .agg(
-            start=("local_date", "min"),
-            end=("local_date", "max"),
-            n_days=("local_date", "count"),
-            missing_temp=("mean_temperature", lambda s: int(pd.to_numeric(s, errors="coerce").isna().sum())),
-            missing_precip=("total_precipitation", lambda s: int(pd.to_numeric(s, errors="coerce").isna().sum())),
-        )
+    st.subheader("Overview")
+    st.markdown(
+        "<div class='muted'>High-signal views first: annual rollups, seasonality, and distribution shifts.</div>",
+        unsafe_allow_html=True
     )
-    city_summary["temp_missing_pct"] = (city_summary["missing_temp"] / city_summary["n_days"] * 100).round(2)
-    city_summary["precip_missing_pct"] = (city_summary["missing_precip"] / city_summary["n_days"] * 100).round(2)
 
-    st.dataframe(city_summary.sort_values(["temp_missing_pct", "precip_missing_pct"], ascending=False), use_container_width=True)
+    # Annual mean temp (coverage-aware)
+    temp_ok = annual_f[annual_f["temp_ok"]].copy()
+    if temp_ok.empty:
+        st.warning("No temp-eligible years under the current coverage threshold. Lower the threshold or widen the year range.")
+    else:
+        chart = a_line(
+            temp_ok,
+            x="year:Q",
+            y="mean_temp:Q",
+            color="city:N",
+            tooltip=["city:N", "year:Q", "mean_temp:Q", "n_temp:Q"],
+            title="Annual Mean Temperature (eligible years only)",
+        )
+        st.altair_chart(chart, use_container_width=True)
 
-    st.markdown('<div class="section-title">Annual snapshot (mean temp + total precip)</div>', unsafe_allow_html=True)
+    # Seasonality: monthly normals comparison (baseline vs recent within selected years)
+    d2 = d.copy()
+    d2["month"] = d2["local_date"].dt.month
 
-    # small multiple-like: choose one city in overview for detail
-    focus_city = st.selectbox("Focus city", options=sorted(d["city"].unique().tolist()), index=0 if n_cities else None)
+    # Use baseline vs recent within overall selection, but compute on full series for stability
+    base_y0, base_y1 = (1961, 1990)
+    rec_y0, rec_y1 = (1991, 2020)
+    sub_base = df_daily[(df_daily["city"].isin(cities_sel)) & (df_daily["year"].between(base_y0, base_y1))].copy()
+    sub_rec = df_daily[(df_daily["city"].isin(cities_sel)) & (df_daily["year"].between(rec_y0, rec_y1))].copy()
+    sub_base["period"] = f"{base_y0}-{base_y1}"
+    sub_rec["period"] = f"{rec_y0}-{rec_y1}"
+    sub_base["month"] = sub_base["local_date"].dt.month
+    sub_rec["month"] = sub_rec["local_date"].dt.month
 
-    if focus_city and not annual.empty:
-        sub = annual[annual["city"] == focus_city].sort_values("year").copy()
-        sub["temp_ok"] = sub["n_temp"] >= int(min_days_per_year)
+    norms = pd.concat([sub_base, sub_rec], ignore_index=True)
+    norms_m = (
+        norms.groupby(["city", "period", "month"], as_index=False)
+        .agg(mean_temp=("mean_temperature", "mean"), n=("mean_temperature", "count"))
+    )
 
+    st.markdown("### Seasonality (Normals)")
+    cA, cB = st.columns([1.2, 1])
+    with cA:
+        chart2 = (
+            alt.Chart(norms_m)
+            .mark_line()
+            .encode(
+                x=alt.X("month:Q", title="Month", scale=alt.Scale(domain=[1, 12])),
+                y=alt.Y("mean_temp:Q", title="Mean temperature (°C)"),
+                color=alt.Color("period:N", legend=alt.Legend(orient="bottom")),
+                facet=alt.Facet("city:N", columns=2),
+                tooltip=["city:N", "period:N", "month:Q", "mean_temp:Q", "n:Q"],
+            )
+            .properties(height=170)
+        )
+        st.altair_chart(chart2, use_container_width=True)
+
+    with cB:
+        st.markdown("### Distribution shift (selected years)")
+        if d.empty:
+            st.info("No data in current filter.")
+        else:
+            # Temperature distribution by city
+            dist = d[["city", "mean_temperature"]].dropna()
+            chart3 = (
+                alt.Chart(dist)
+                .transform_density(
+                    "mean_temperature",
+                    as_=["mean_temperature", "density"],
+                    groupby=["city"],
+                )
+                .mark_area(opacity=0.25)
+                .encode(
+                    x=alt.X("mean_temperature:Q", title="Temperature (°C)"),
+                    y=alt.Y("density:Q", title=None),
+                    color=alt.Color("city:N", legend=alt.Legend(orient="bottom", columns=2)),
+                    tooltip=["city:N", "mean_temperature:Q", "density:Q"],
+                )
+                .properties(height=380)
+            )
+            st.altair_chart(chart3, use_container_width=True)
+
+
+elif page == "Trends":
+    st.subheader("Trends")
+    st.markdown("<div class='muted'>OLS slopes computed on coverage-eligible annual series; includes uncertainty bands.</div>", unsafe_allow_html=True)
+
+    t = temp_trends[temp_trends["city"].isin(cities_sel)].copy()
+    p = precip_trends[precip_trends["city"].isin(cities_sel)].copy()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### Warming rate (°C/decade)")
+        if t.empty:
+            st.info("No trend results available for selected cities (coverage gate may be too strict).")
+        else:
+            bar = (
+                alt.Chart(t)
+                .mark_bar()
+                .encode(
+                    x=alt.X("slope_c_per_decade:Q", title="°C/decade"),
+                    y=alt.Y("city:N", sort="-x", title=None),
+                    tooltip=["city:N", "n:Q", "slope_c_per_decade:Q", "ci_lo:Q", "ci_hi:Q"],
+                )
+                .properties(height=360)
+            )
+            err = (
+                alt.Chart(t)
+                .mark_rule()
+                .encode(
+                    x="ci_lo:Q",
+                    x2="ci_hi:Q",
+                    y=alt.Y("city:N", sort="-x"),
+                )
+            )
+            st.altair_chart((bar + err), use_container_width=True)
+
+    with c2:
+        st.markdown("### Precipitation trend (mm/decade)")
+        if p.empty:
+            st.info("No precip trend results available for selected cities (coverage gate may be too strict).")
+        else:
+            bar2 = (
+                alt.Chart(p)
+                .mark_bar()
+                .encode(
+                    x=alt.X("slope_mm_per_decade:Q", title="mm/decade"),
+                    y=alt.Y("city:N", sort="-x", title=None),
+                    tooltip=["city:N", "n:Q", "slope_mm_per_decade:Q", "ci_lo:Q", "ci_hi:Q"],
+                )
+                .properties(height=360)
+            )
+            err2 = (
+                alt.Chart(p)
+                .mark_rule()
+                .encode(
+                    x="ci_lo:Q",
+                    x2="ci_hi:Q",
+                    y=alt.Y("city:N", sort="-x"),
+                )
+            )
+            st.altair_chart((bar2 + err2), use_container_width=True)
+
+    st.markdown("### Rolling 10-year mean (temperature)")
+    temp_ok = annual_f[annual_f["temp_ok"]].copy()
+    if temp_ok.empty:
+        st.warning("No temp-eligible years under the current coverage threshold.")
+    else:
+        tmp = temp_ok.sort_values(["city", "year"]).copy()
+        tmp["roll10"] = (
+            tmp.groupby("city")["mean_temp"]
+            .transform(lambda s: s.rolling(10, min_periods=7).mean())
+        )
+        chart = a_line(
+            tmp.dropna(subset=["roll10"]),
+            x="year:Q",
+            y="roll10:Q",
+            color="city:N",
+            tooltip=["city:N", "year:Q", "roll10:Q"],
+            title="Rolling 10-year mean temperature",
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+
+elif page == "Extremes":
+    st.subheader("Extremes")
+    st.markdown(
+        f"<div class='muted'>Extremes are defined relative to the baseline quantiles (≤p05 and ≥p95) for {baseline[0]}–{baseline[1]}.</div>",
+        unsafe_allow_html=True
+    )
+
+    ex = extremes[(extremes["city"].isin(cities_sel)) & (extremes["year"].between(year_range[0], year_range[1])) & (extremes["year_ok"])].copy()
+
+    if ex.empty:
+        st.warning("No extreme-day series available under current filters. Try lowering the coverage threshold.")
+    else:
         c1, c2 = st.columns(2)
 
         with c1:
-            fig = plt.figure(figsize=(10, 4))
-            ax = plt.gca()
-            ax.plot(sub["year"], sub["mean_temp"])
-            ax.set_title(f"{focus_city} — Annual Mean Temperature")
-            ax.set_xlabel("Year")
-            ax.set_ylabel("°C")
-            st.pyplot(fig, clear_figure=True)
+            chart_hot = a_line(
+                ex,
+                x="year:Q",
+                y="hot_days:Q",
+                color="city:N",
+                tooltip=["city:N", "year:Q", "hot_days:Q", "n_temp:Q"],
+                title=f"Hot extreme days/year (≥ p95 of {baseline[0]}–{baseline[1]})",
+            )
+            st.altair_chart(chart_hot, use_container_width=True)
 
         with c2:
-            fig = plt.figure(figsize=(10, 4))
-            ax = plt.gca()
-            ax.plot(sub["year"], sub["total_precip"])
-            ax.set_title(f"{focus_city} — Annual Total Precipitation")
-            ax.set_xlabel("Year")
-            ax.set_ylabel("mm")
-            st.pyplot(fig, clear_figure=True)
+            chart_cold = a_line(
+                ex,
+                x="year:Q",
+                y="cold_days:Q",
+                color="city:N",
+                tooltip=["city:N", "year:Q", "cold_days:Q", "n_temp:Q"],
+                title=f"Cold extreme days/year (≤ p05 of {baseline[0]}–{baseline[1]})",
+            )
+            st.altair_chart(chart_cold, use_container_width=True)
 
-# -----------------------------
-# Trends
-# -----------------------------
-elif page == "Trends":
-    st.markdown('<div class="section-title">Temperature trends (coverage-aware)</div>', unsafe_allow_html=True)
+        st.markdown("### Extremes regime shift (baseline vs recent)")
+        # Compare mean annual extremes for baseline vs recent
+        def _period(y):
+            if 1961 <= y <= 1990:
+                return "1961–1990"
+            if 1991 <= y <= 2020:
+                return "1991–2020"
+            return None
 
-    annual2 = annual.copy()
-    annual2["temp_ok"] = annual2["n_temp"] >= int(min_days_per_year)
+        ex2 = extremes[extremes["city"].isin(cities_sel)].copy()
+        ex2["period"] = ex2["year"].apply(_period)
+        ex2 = ex2.dropna(subset=["period"])
+        shift = (
+            ex2.groupby(["city", "period"], as_index=False)
+            .agg(hot_days=("hot_days", "mean"), cold_days=("cold_days", "mean"))
+        )
+        shift_long = shift.melt(id_vars=["city", "period"], var_name="metric", value_name="days")
 
-    # plot all selected cities on one axis (readable when <= ~10)
-    cities_in_view = sorted(annual2["city"].unique().tolist())
-    if not cities_in_view:
-        st.warning("No data in view for the chosen filters.")
-    else:
-        fig = plt.figure(figsize=(12, 5))
-        ax = plt.gca()
-        for c in cities_in_view:
-            s = annual2[(annual2["city"] == c) & (annual2["temp_ok"])].sort_values("year")
-            if len(s) >= 2:
-                ax.plot(s["year"], s["mean_temp"], linewidth=1, label=c)
-        ax.set_title("Annual Mean Temperature (temp-eligible years only)")
-        ax.set_xlabel("Year")
-        ax.set_ylabel("°C")
-        if len(cities_in_view) <= 12:
-            ax.legend(ncol=3, fontsize=8)
-        st.pyplot(fig, clear_figure=True)
+        chart_shift = (
+            alt.Chart(shift_long)
+            .mark_bar()
+            .encode(
+                x=alt.X("days:Q", title="Avg days/year"),
+                y=alt.Y("city:N", title=None),
+                color=alt.Color("period:N", legend=alt.Legend(orient="bottom")),
+                column=alt.Column("metric:N", title=None),
+                tooltip=["city:N", "period:N", "metric:N", "days:Q"],
+            )
+            .properties(height=280)
+        )
+        st.altair_chart(chart_shift, use_container_width=True)
 
-        # Trend table
-        rows = []
-        for c in cities_in_view:
-            s = annual2[(annual2["city"] == c) & (annual2["temp_ok"])].sort_values("year")
-            slope_dec = _ols_slope_per_decade(s["year"].to_numpy(), s["mean_temp"].to_numpy())
-            rows.append({"city": c, "warming_trend_°C_per_decade": slope_dec, "n_years_used": int(len(s))})
-        trends = pd.DataFrame(rows).sort_values("warming_trend_°C_per_decade", ascending=False)
 
-        st.markdown('<div class="section-title">OLS warming slope (°C/decade)</div>', unsafe_allow_html=True)
-        st.dataframe(trends, use_container_width=True)
-
-# -----------------------------
-# Extremes
-# -----------------------------
-elif page == "Extremes":
-    st.markdown('<div class="section-title">Temperature extremes (baseline quantiles)</div>', unsafe_allow_html=True)
-    st.caption(f"Cold extreme = ≤ p05 of {BASELINE[0]}–{BASELINE[1]}; Hot extreme = ≥ p95 of {BASELINE[0]}–{BASELINE[1]}. Only years meeting coverage threshold are included.")
-
-    ex = extremes[extremes["temp_ok"]].copy()
-    if ex.empty:
-        st.warning("No extreme indices available under current filters (coverage threshold may be too strict).")
-    else:
-        cities_in_view = sorted(ex["city"].unique().tolist())
-
-        # Hot extremes plot
-        fig = plt.figure(figsize=(12, 5))
-        ax = plt.gca()
-        for c in cities_in_view:
-            s = ex[ex["city"] == c].sort_values("year")
-            ax.plot(s["year"], s["hot_days"], linewidth=1, label=c)
-        ax.set_title(f"Hot extreme days per year (≥ p95 of {BASELINE[0]}–{BASELINE[1]})")
-        ax.set_xlabel("Year")
-        ax.set_ylabel("Days")
-        if len(cities_in_view) <= 12:
-            ax.legend(ncol=3, fontsize=8)
-        st.pyplot(fig, clear_figure=True)
-
-        # Cold extremes plot
-        fig = plt.figure(figsize=(12, 5))
-        ax = plt.gca()
-        for c in cities_in_view:
-            s = ex[ex["city"] == c].sort_values("year")
-            ax.plot(s["year"], s["cold_days"], linewidth=1, label=c)
-        ax.set_title(f"Cold extreme days per year (≤ p05 of {BASELINE[0]}–{BASELINE[1]})")
-        ax.set_xlabel("Year")
-        ax.set_ylabel("Days")
-        if len(cities_in_view) <= 12:
-            ax.legend(ncol=3, fontsize=8)
-        st.pyplot(fig, clear_figure=True)
-
-        # Summary table
-        baseline_mean = ex[(ex["year"] >= BASELINE[0]) & (ex["year"] <= BASELINE[1])].groupby("city", as_index=False)[["hot_days", "cold_days"]].mean()
-        recent_mean = ex[(ex["year"] >= RECENT[0]) & (ex["year"] <= RECENT[1])].groupby("city", as_index=False)[["hot_days", "cold_days"]].mean()
-
-        summary = baseline_mean.merge(recent_mean, on="city", suffixes=("_baseline", "_recent"))
-        summary["Δ hot days (recent-baseline)"] = summary["hot_days_recent"] - summary["hot_days_baseline"]
-        summary["Δ cold days (recent-baseline)"] = summary["cold_days_recent"] - summary["cold_days_baseline"]
-
-        st.markdown('<div class="section-title">Baseline vs recent (mean days/year)</div>', unsafe_allow_html=True)
-        st.dataframe(summary.sort_values("Δ hot days (recent-baseline)", ascending=False), use_container_width=True)
-
-# -----------------------------
-# Maps
-# -----------------------------
 elif page == "Maps":
-    st.markdown('<div class="section-title">Spatial patterns</div>', unsafe_allow_html=True)
-    st.caption("These are true maps (georeferenced points) rendered with pydeck. Labels are included; zoom adjusts to your city selection.")
-
-    # Build map layers from current view
-    map_df = compute_map_layers(
-        annual=annual,
-        extremes=extremes,
-        year_range=year_range,
-        min_days_per_year=min_days_per_year,
-        baseline=BASELINE,
-        recent=RECENT,
+    st.subheader("Spatial patterns")
+    st.markdown(
+        "<div class='muted'>These are true maps (georeferenced points) rendered with pydeck. "
+        "Use the layer selector to switch between trend and extremes surfaces.</div>",
+        unsafe_allow_html=True
     )
 
-    # Keep only cities we can geocode
-    map_df = map_df.dropna(subset=["lat", "lon"]).copy()
+    coords = _get_city_latlon(df_daily)
+    coords = coords[coords["city"].isin(cities_sel)].copy()
+
+    # Attach trend + regime shift metrics
+    t = temp_trends.copy()
+    p = precip_trends.copy()
+
+    # Compute extremes shift (recent-baseline)
+    ex = extremes.copy()
+    ex["period"] = np.where(ex["year"].between(1961, 1990), "1961–1990",
+                    np.where(ex["year"].between(1991, 2020), "1991–2020", None))
+    ex = ex.dropna(subset=["period"])
+    exm = (
+        ex.groupby(["city", "period"], as_index=False)
+        .agg(hot=("hot_days", "mean"), cold=("cold_days", "mean"))
+    )
+    exw = exm.pivot(index="city", columns="period", values=["hot", "cold"])
+    # Safe access
+    def _get(w, metric, period):
+        try:
+            return w[(metric, period)]
+        except Exception:
+            return pd.Series(index=w.index, dtype=float)
+
+    ex_shift = pd.DataFrame({"city": exw.index})
+    ex_shift["d_hot"] = (_get(exw, "hot", "1991–2020") - _get(exw, "hot", "1961–1990")).values
+    ex_shift["d_cold"] = (_get(exw, "cold", "1991–2020") - _get(exw, "cold", "1961–1990")).values
+
+    m = coords.merge(t[["city", "slope_c_per_decade"]], on="city", how="left")
+    m = m.merge(p[["city", "slope_mm_per_decade"]], on="city", how="left")
+    m = m.merge(ex_shift, on="city", how="left")
 
     layer = st.selectbox(
         "Map layer",
         [
-            "Warming trend (°C/decade)",
-            f"Δ hot extreme days (avg/yr): {RECENT[0]}–{RECENT[1]} vs {BASELINE[0]}–{BASELINE[1]}",
-            f"Δ cold extreme days (avg/yr): {RECENT[0]}–{RECENT[1]} vs {BASELINE[0]}–{BASELINE[1]}",
+            "Warming trend (°C/decade) — extruded columns",
+            "Precip trend (mm/decade) — extruded columns",
+            "Hot extremes shift (days/year) — scatter + heat",
+            "Cold extremes shift (days/year) — scatter + heat",
         ],
         index=0,
     )
 
-    if layer.startswith("Warming trend"):
-        value_col = "warming_trend_decade"
-        title = "Warming trend (°C/decade)"
-    elif "Δ hot" in layer:
-        value_col = "delta_hot_days"
-        title = "Change in hot extreme days (avg/yr)"
+    # Auto-zoom to selection
+    if len(m) == 1:
+        center_lat, center_lon = float(m.iloc[0]["lat"]), float(m.iloc[0]["lon"])
+        zoom = 4.2
     else:
-        value_col = "delta_cold_days"
-        title = "Change in cold extreme days (avg/yr)"
+        center_lat, center_lon = float(m["lat"].mean()), float(m["lon"].mean())
+        zoom = 3.1
 
-    if map_df.empty:
-        st.warning("No mappable points available (cities missing coordinates).")
-    else:
-        deck = make_pydeck_map(
-            df_points=map_df.rename(columns={"warming_trend_decade": "warming_trend_decade", "delta_hot_days": "delta_hot_days", "delta_cold_days": "delta_cold_days"}),
-            value_col=value_col,
-            title=title,
-            selected_cities=selected_cities,
+    view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom, pitch=35)
+
+    # Visual scaling helpers
+    def _finite(series):
+        s = pd.to_numeric(series, errors="coerce")
+        return s[np.isfinite(s)]
+
+    # Build layers
+    layers = []
+
+    # Labels
+    layers.append(
+        pdk.Layer(
+            "TextLayer",
+            data=m,
+            get_position="[lon, lat]",
+            get_text="city",
+            get_size=13,
+            get_color=[30, 30, 30],
+            get_angle=0,
+            get_alignment_baseline="'bottom'",
         )
-        st.pydeck_chart(deck, use_container_width=True)
+    )
 
-        with st.expander("Show mapped metrics table", expanded=False):
-            show_cols = ["city", "warming_trend_decade", "delta_hot_days", "delta_cold_days", "lat", "lon"]
-            st.dataframe(map_df[show_cols].sort_values("city"), use_container_width=True)
+    if "Warming trend" in layer:
+        v = m["slope_c_per_decade"]
+        s = _finite(v)
+        vmax = float(np.nanpercentile(np.abs(s), 95)) if len(s) else 1.0
 
-# -----------------------------
-# Download
-# -----------------------------
+        m2 = m.copy()
+        m2["val"] = pd.to_numeric(m2["slope_c_per_decade"], errors="coerce").fillna(0.0)
+
+        # ColumnLayer: elevation carries magnitude; color by sign
+        layers.append(
+            pdk.Layer(
+                "ColumnLayer",
+                data=m2,
+                get_position="[lon, lat]",
+                get_elevation="abs(val) * 120000",   # tuned for Canada zoom
+                elevation_scale=1,
+                radius=22000,
+                get_fill_color="""
+                    [ 30, 144, 255, 180 ] if val >= 0 else [ 25, 25, 112, 180 ]
+                """,
+                pickable=True,
+                auto_highlight=True,
+            )
+        )
+        tooltip = {"html": "<b>{city}</b><br/>Warming: {val} °C/decade", "style": {"backgroundColor": "white"}}
+        title = "Warming trend (°C/decade) — extruded columns"
+
+    elif "Precip trend" in layer:
+        v = m["slope_mm_per_decade"]
+        s = _finite(v)
+        vmax = float(np.nanpercentile(np.abs(s), 95)) if len(s) else 1.0
+
+        m2 = m.copy()
+        m2["val"] = pd.to_numeric(m2["slope_mm_per_decade"], errors="coerce").fillna(0.0)
+
+        layers.append(
+            pdk.Layer(
+                "ColumnLayer",
+                data=m2,
+                get_position="[lon, lat]",
+                get_elevation="abs(val) * 2000",
+                elevation_scale=1,
+                radius=22000,
+                get_fill_color="""
+                    [ 60, 179, 113, 180 ] if val >= 0 else [ 178, 34, 34, 180 ]
+                """,
+                pickable=True,
+                auto_highlight=True,
+            )
+        )
+        tooltip = {"html": "<b>{city}</b><br/>Precip trend: {val} mm/decade", "style": {"backgroundColor": "white"}}
+        title = "Precipitation trend (mm/decade) — extruded columns"
+
+    elif "Hot extremes shift" in layer:
+        m2 = m.copy()
+        m2["val"] = pd.to_numeric(m2["d_hot"], errors="coerce").fillna(0.0)
+
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=m2,
+                get_position="[lon, lat]",
+                get_radius="8000 + abs(val) * 2500",
+                radius_min_pixels=6,
+                radius_max_pixels=60,
+                get_fill_color="""
+                    [ 255, 69, 0, 170 ] if val >= 0 else [ 65, 105, 225, 170 ]
+                """,
+                pickable=True,
+                auto_highlight=True,
+            )
+        )
+        layers.append(
+            pdk.Layer(
+                "HeatmapLayer",
+                data=m2,
+                get_position="[lon, lat]",
+                get_weight="abs(val)",
+                radiusPixels=90,
+            )
+        )
+        tooltip = {"html": "<b>{city}</b><br/>Δ hot extremes: {val} days/yr", "style": {"backgroundColor": "white"}}
+        title = "Change in hot-extreme frequency (1991–2020 vs 1961–1990)"
+
+    else:  # Cold extremes shift
+        m2 = m.copy()
+        m2["val"] = pd.to_numeric(m2["d_cold"], errors="coerce").fillna(0.0)
+
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=m2,
+                get_position="[lon, lat]",
+                get_radius="8000 + abs(val) * 2500",
+                radius_min_pixels=6,
+                radius_max_pixels=60,
+                get_fill_color="""
+                    [ 30, 144, 255, 170 ] if val <= 0 else [ 255, 165, 0, 170 ]
+                """,
+                pickable=True,
+                auto_highlight=True,
+            )
+        )
+        layers.append(
+            pdk.Layer(
+                "HeatmapLayer",
+                data=m2,
+                get_position="[lon, lat]",
+                get_weight="abs(val)",
+                radiusPixels=90,
+            )
+        )
+        tooltip = {"html": "<b>{city}</b><br/>Δ cold extremes: {val} days/yr", "style": {"backgroundColor": "white"}}
+        title = "Change in cold-extreme frequency (1991–2020 vs 1961–1990)"
+
+    st.markdown(f"### {title}")
+    deck = pdk.Deck(
+        map_style="mapbox://styles/mapbox/light-v10",
+        initial_view_state=view_state,
+        layers=layers,
+        tooltip=tooltip,
+    )
+    st.pydeck_chart(deck, use_container_width=True)
+
+    st.markdown(
+        "<div class='small muted'>Tip: If you select just one city, the map will zoom in automatically; for many cities, columns and point radii scale by magnitude.</div>",
+        unsafe_allow_html=True
+    )
+
+
 elif page == "Download":
-    st.markdown('<div class="section-title">Download data</div>', unsafe_allow_html=True)
-    st.caption("Exports reflect your current filters (cities + year range + coverage threshold affects derived tables).")
+    st.subheader("Download")
+    st.markdown("<div class='muted'>Export filtered datasets for reporting or reuse.</div>", unsafe_allow_html=True)
+
+    # Filtered extracts
+    d_out = d.copy()
+    annual_out = annual_f.copy()
 
     st.download_button(
         "Download filtered daily (CSV)",
-        data=d.to_csv(index=False).encode("utf-8"),
-        file_name="canada_climate_filtered_daily.csv",
+        data=d_out.to_csv(index=False).encode("utf-8"),
+        file_name="filtered_daily.csv",
         mime="text/csv",
-        use_container_width=True,
+    )
+    st.download_button(
+        "Download filtered annual rollup (CSV)",
+        data=annual_out.to_csv(index=False).encode("utf-8"),
+        file_name="filtered_annual.csv",
+        mime="text/csv",
     )
 
-    annual_export = annual.copy()
-    annual_export["temp_ok"] = annual_export["n_temp"] >= int(min_days_per_year)
+    ex_out = extremes[(extremes["city"].isin(cities_sel)) & extremes["year"].between(year_range[0], year_range[1])].copy()
     st.download_button(
-        "Download annual metrics (CSV)",
-        data=annual_export.to_csv(index=False).encode("utf-8"),
-        file_name="canada_climate_annual_metrics.csv",
+        "Download extremes (CSV)",
+        data=ex_out.to_csv(index=False).encode("utf-8"),
+        file_name="filtered_extremes.csv",
         mime="text/csv",
-        use_container_width=True,
-    )
-
-    ex_export = extremes.copy()
-    st.download_button(
-        "Download extremes indices (CSV)",
-        data=ex_export.to_csv(index=False).encode("utf-8"),
-        file_name="canada_climate_extremes_indices.csv",
-        mime="text/csv",
-        use_container_width=True,
     )
